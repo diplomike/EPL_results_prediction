@@ -1,4 +1,5 @@
 library(tidyverse)
+library(recosystem)
 library(readxl)
 library(caret)
 library(randomForest)
@@ -308,3 +309,61 @@ confusionMatrix(predict(HG_rf, RcntHAAHX %>% filter(Season==TestSeason)) %>% rou
 # Confusion matrix for AG random forest model
 confusionMatrix(predict(AG_rf, RcntHAAHX %>% filter(Season==TestSeason)) %>% round %>% factor,
                 RcntHAAHX %>% filter(Season==TestSeason) %>% .$AG %>% factor)
+
+# ___________________________________________________________________________
+# Recosystem algorithm
+
+# Create numerical index for teams
+team_index <- epl_results %>% group_by(HomeTeam) %>% rename(TeamName= HomeTeam) %>%
+  summarize %>% mutate(TeamID = as.integer(rownames(.))) %>% print(n=50)
+
+# Counting HXH matches only in recent seasons
+TrainSeasons <- filter(epl_results, Season >="2017-18") %>% group_by(Season) %>% summarize %>% pull
+
+# Head-to-Head Scores train set
+train_data <- epl_results %>% filter(Season %in% TrainSeasons & !is.na(FTHG)) %>%
+  inner_join(team_index, c("HomeTeam"="TeamName")) %>% rename (HmID = TeamID) %>% 
+  inner_join(team_index, c("AwayTeam"="TeamName")) %>% rename (AwID = TeamID) %>%
+  select(HmID, HomeTeam, AwID, AwayTeam, FTHG, FTAG) 
+
+# Head-to-Head Scores test set
+test_data <- epl_results %>% filter(Season %in% TestSeason & is.na(FTHG)) %>%
+  inner_join(team_index, c("HomeTeam"="TeamName")) %>% rename (HmID = TeamID) %>% 
+  inner_join(team_index, c("AwayTeam"="TeamName")) %>% rename (AwID = TeamID) %>%
+  select(HmID, HomeTeam, AwID, AwayTeam, FTHG, FTAG) 
+
+# Home Team scores plot
+train_data %>% ggplot(aes(AwayTeam, HomeTeam, col=FTHG)) + 
+  geom_point() + scale_color_gradientn(colors=rainbow(5)) +
+  scale_x_discrete(guide = guide_axis(angle = 90))
+
+# Away Team scores plot
+train_data %>% ggplot(aes(HomeTeam, AwayTeam, col=FTAG)) + 
+  geom_point() + scale_color_gradientn(colors=rainbow(5)) +
+  scale_x_discrete(guide = guide_axis(angle = 90))
+
+# Tuning & training
+HG_train_data <- data_memory(train_data$HmID, train_data$AwID, train_data$FTHG)
+HG_reco = Reco()
+HG_reco$tune(HG_train_data, opts = list(dim=1:20, costp_l2=0, 
+                                        costq_l2=0, lrate =0.01))
+HG_reco$train(HG_train_data, opts = list(dim=12, loss = "l1", 
+                                         lrate = 0.01, niter = 100,
+                                         costp_l1=0, costp_l2=0, 
+                                         costq_l1=0, costq_l2=0))
+
+AG_train_data <- data_memory(train_data$AwID, train_data$HmID, train_data$FTAG)
+AG_reco = Reco()
+AG_reco$tune(AG_train_data, opts = list(dim=1:20, costp_l2=0, 
+                                        costq_l2=0, lrate =0.01))
+AG_reco$train(AG_train_data, opts = list(dim=9, loss = "l1", 
+                                         lrate=0.01, niter = 100,
+                                         costp_l1=0, costp_l2=0, 
+                                         costq_l1=0, costq_l2=0))
+
+# Predict, evaluate & compare with actual results
+HG_pred <- HG_reco$predict(data_memory(test_data$HmID, test_data$AwID), out_memory()) %>% round
+AG_pred <- AG_reco$predict(data_memory(test_data$AwID, test_data$HmID), out_memory()) %>% round
+mean(HG_pred == test_data$FTHG) * mean(AG_pred == test_data$FTAG)
+
+cbind(test_data, HG_pred, AG_pred)
