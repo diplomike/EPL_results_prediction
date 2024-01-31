@@ -1,0 +1,699 @@
+---
+title: "English Premier League correct score prediction"
+author: "Michael Lai"
+output:
+  html_document: 
+    toc: yes
+  html_notebook:
+    number_sections: yes
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(DT)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+knitr::opts_chunk$set(comment = NA, cache = TRUE)
+options(timeout = 120, digits=4, max.print=1000, width = 85, warn = 0)
+n=7
+```
+
+```{r date, echo=F}
+cat(c("Last updated:", date()))
+```
+
+------------------------------------------------------------------------
+
+# Introduction & Overview
+
+------------------------------------------------------------------------
+
+Football (or soccer in American English) is arguably the most popular sport on the planet, with over 4 billion fans watching the games worldwide (1). And among the professional leagues around the world, the English Premier League (EPL) is in turn arguably the most commercially successful, with its viewership skyrocketing in recent years. Established since 1992, the top-flight professional league in England currently comprises 20 teams from the region and (on a few occasions) Wales. With each team playing each other once at home and once away, there are a total of 380 matches per season. Each team will be awarded 3 points for a win, 1 point for a draw and no point for a loss. The team with the most number of points at the end of the season becomes the EPL Championship, while the three teams at the bottom will be relegated to the second tier of the league ladder and replaced by the top 3 teams from that tier. With the exception of 2019-2020 where COVID-19 disrupted the normal schedule of the tournament, a typical season starts in August and ends in May the next year.
+
+And always comes with any major sporting activity is the gambling business behind it. The betting companies offer a plethora of betting choices, ranging from Full-Time Result (Home Team Win/Home Team Loss/Draw), Total Goals (total number of goals above or below a certain threshold), Correct Scores (predicting the exact scores for both teams) and a myriad of other types, each having a different range of odds. Obviously, the more difficult to predict a certain outcome, the higher its odds will be.
+
+While not encouraging reckless gambling, some people have pondered whether it is possible to use statistical models to predict the outcome of a game so as to make a predictable profit over the long run or, in layman terms, "beat the bookies". Indeed, an article on Medium tries to explore such a possibility by using Python to predict the Full-Time Result and claim to have moderate success. (2) Inspired by such an analysis, this article will explore the possibility of predicting the Correct Scores by R using past match results, and if it goes well, beating the bookies in this betting category. As for the definition of past match results, although the teams may also have played other non-EPL matches such the FA Cup and EUFA Champions League, for simplicity purposes they are excluded from this exercise. 
+
+------------------------------------------------------------------------
+
+# Method & Data Preparation
+
+------------------------------------------------------------------------
+
+To gather data from all EPL previous seasons into a single datasheet would be a daunting task. Luckily, thanks to the gambling lovers worldwide the betting website football-data.co.uk has generously performed this monumental task (3). The csv files are divided into seasons though, so I have downloaded the years from 2016-2024 (up to 30 Jan 2024) and manually merged them into a single Excel file. The results are verified against the official EPL website (4). The updated file is uploaded to Github as an Excel file "EPL_results.xlsx" and can be accessed by the following code:
+
+```{r 01/Download the file from github, warning=FALSE}
+if(!file.exists("EPL_results.xlsx"))
+download.file("https://github.com/diplomike/EPL_results_prediction/raw/main/EPL_results.xlsx",
+"EPL_results.xlsx", mode="wb")
+```
+
+After downloading the file, it is read into R.
+
+```{r 02/Load the Excel file into the database and inspect its content, warning=FALSE}
+datatable(read_xlsx("EPL_results.xlsx"),list(
+  autowidth = T,
+  scrollX = T,
+  pageLength = 13,
+  dom = 't'
+  ))
+```
+
+Although there are many columns for detailed statistics of each match, we are primarily concerned with the 8 variables, namely Season, MatchDate, HomeTeam, AwayTeam, FTHG (full time home score), FTAG (full time away score), HTHG (half-time home score),and HTAG (half-time away score). The remaining variables are omitted for the time being to simplify the project.
+
+```{r 03/Prune the data frame variables}
+datatable(epl_results <- 
+            read_xlsx("EPL_results.xlsx", range = cell_cols(1:9),
+                      col_types = c("text", "date", "skip", "text", "text", 
+                                    "numeric","numeric", "numeric", "numeric")) %>%
+  select(Season, MatchDate, HomeTeam, AwayTeam, FTHG, FTAG, HTHG, HTAG), 
+  filter = 'top', list(pageLength = 10))
+```
+
+The data frame below shows the number of records for each season.
+
+```{r 04/Check the number of matches played}
+datatable(epl_results %>% group_by(Season) %>% summarize(matches=n()) %>% 
+            group_by(matches) %>% 
+            summarize(From = str_sub(min(Season),1,4),
+                      To = as.numeric(str_sub(max(Season),1,4))+1)%>%
+            arrange(From) %>% select(From, To, matches) %>% 
+            rename("Matches per season"=matches),
+          rownames = F,
+          list(dom = "t", columnDefs = list(list(className = "dt-right",targets = 0)),
+                                            list(className = "dt-left",targets = c(1,2))))
+```
+
+The first 7 seasons have all 380 matches completed, a while little over half of the matches of the 2023-24 season have been played. To verify the data in the current season are correct, the code below produces the league table as of 30 Jan 2024, and the statistics are compared to the official site.
+
+```{r 05/Most up-to-date league table}
+datatable(epl_results %>% filter(Season=="2023-24") %>% select(HomeTeam, AwayTeam, FTHG, FTAG) %>%
+  pivot_longer(HomeTeam:AwayTeam, names_to= "venue", values_to = "Team") %>%
+  mutate(Won = ifelse((FTHG-FTAG)*(venue=="HomeTeam")+(FTAG-FTHG)*(venue=="AwayTeam") > 0, 1, 0),
+         Drawn = ifelse(FTHG == FTAG, 1, 0),
+         Lost = ifelse((FTHG-FTAG)*(venue=="HomeTeam")+(FTAG-FTHG)*(venue=="AwayTeam") < 0, 1, 0),
+         GF = ifelse(venue=="HomeTeam", FTHG, FTAG),
+         GA = ifelse(venue=="AwayTeam", FTHG, FTAG),
+         GD = GF-GA, Pts = Won * 3 + Drawn) %>%
+  group_by(Team) %>% summarize(Played = n(), Won=sum(Won), Drawn=sum(Drawn), Lost=sum(Lost),
+                               GF=sum(GF),GA=sum(GA), GD=sum(GD), Pts=sum(Pts)) %>%
+  arrange(desc(Pts), desc(GD),desc(GF)), 
+  list(scrollX = T, dom = "t", pageLength=20))
+```
+
+First of all, we would like to investigate the score difference between home and away matches. The so-called Home Field Advantage is a well established phenomenon observed in various sports worldwide and with literature explaining the factors that might contribute to this (5). Nonetheless, it is still a good practice to review the current statistics to inspect visually if such a phenomenon exists in the EPL. Below are the code and results.
+
+```{r 06/Home and away goal distributions, warning=FALSE}
+epl_results %>% mutate(HomeGoals= FTHG, AwayGoals = FTAG) %>%
+  pivot_longer(HomeGoals:AwayGoals, values_to = "Goals", names_to = "Type") %>%
+  ggplot(aes(Goals, fill = Type)) + geom_bar(position = "dodge") +
+  scale_x_discrete(breaks = 0:8,limits=(0:8))
+```
+
+The graph clearly suggests a strong Home Field Advantage in the EPL, with the Home Team scores skewed much more to the right than the Away Team scores. Among the speculations as to what constituted to Home Field Advantage, one suggestion is the presence of home fans at the stadium. Therefore, it would be interesting to see how this effect was offset by COVID-19, where during prolonged periods of time teams were forced to play behind closed doors, which was largely the case for Season 2020-21 (6).
+
+```{r 07/Home away goal difference across seasons}
+epl_results %>% group_by(Season) %>%
+  summarize("Avg Home Goals" = mean(FTHG),"Avg Away Goals" = mean(FTAG),
+            "Avg Goal Diff"= mean(FTHG)-mean(FTAG)) %>%
+  pivot_longer("Avg Home Goals":"Avg Goal Diff", names_to = "type", values_to = "score") %>%
+  ggplot(aes(Season, score, color=type)) + geom_point() +
+  scale_x_discrete(guide = guide_axis(angle = 90)) + ylim(0,2)
+```
+
+A very interesting pattern emerges from this graph. It shows an almost negligible Home Field Advantage for Season 2020-21 in terms of average home-away team goal difference. Regardless of whether this is indeed attributable to the absence of the crowds, this season shall be excluded in our training data due to its abnormal home field effect. Therefore we will use only results from Seasons 2019-20 up to 30 Nov 2023 as our training data, while the results from 1 Dec 2023 onwards will be the testing data. (Results from 2016-2019 are used to retrieve head-to-head encounter records within the previous three years from the 2019-20 season onward, as we shall we later.)
+
+```{r 08/Filter old and abnormal seasons, assign corresponding seasons for training and testing data}
+ 
+TrainData <- filter(epl_results, Season >= "2019-20" & Season != "2020-21" & MatchDate < "2023-12-01")
+TestData <- filter(epl_results, MatchDate >= "2023-12-01")
+```
+
+With all these parameters defined, we can now inspect the descriptive statistics of both the Home and Away team scores in the training set - namely the mean, median, mode and standard deviation. First let us see the goal averages:
+
+```{r 09/Train set home and away mean scores}
+datatable(TrainData %>%
+  summarize ("Avg Home Goal" = mean(FTHG), "Avg Away Goal" = mean(FTAG)) %>% round(3),
+  rownames = FALSE,
+  list(dom ="t", columnDefs = list(list(className = "dt-center", targets = 0:1))))
+```
+
+As shown earlier, the home team on average scores more goals than the away team in a match. Next we will check the goal medians:
+
+```{r 10/Train set home and away median scores}
+datatable(TrainData %>%
+  summarize ("Median Home Goal" = median(FTHG), "Median Away Goal" = median(FTAG)),
+  rownames = FALSE,
+  list(dom ="t", columnDefs = list(list(className = "dt-center", targets = 0:1))))
+```
+
+While there is a difference in the average number of goals scored, the median home and away scores are the same as both distributions skew to the left with both medians residing at the lower end. We then look at the goal distributions of the goals in separate tables:
+
+```{r 11/Home Goals distribution}
+datatable(table(TrainData$FTHG) %>% as.data.frame %>% t,
+          rownames = c("Goals scored", "Match count"),
+          colnames = c("Home goal distribution", 
+                       rep("",length(table(TrainData$FTHG)))),
+          list(dom ="t"))
+```
+
+```{r 12/Aawy Goals distribution}
+datatable(table(TrainData$FTAG) %>% as.data.frame %>% t,
+          rownames = c("Goals scored", "Match count"),
+          colnames = c("Away goal distribution", rep("",length(table(TrainData$FTAG)))),
+          list(dom ="t"))
+```
+
+Again the most frequent scores for both teams are 1 due to skewness of the distribution, though for the away teams it only slightly outnumbers a nil score. As for the goal standard deviations (SD):
+
+```{r 13/Train set home and away score standard deviations}
+datatable(TrainData %>%
+  summarize ("Home Goal SD" = sd(FTHG), "Away Goal SD" = sd(FTAG)) %>% round(3),
+  rownames = FALSE, 
+  list(dom ="t", columnDefs = list(list(className = "dt-center", targets = 0:1)))) 
+```
+
+Because home teams have a wider spread of scores, it is expected that their goal SD is also higher than that of the away teams.
+
+As the aim of this project is to predict the Correct Scores for both home and away teams, which must be in integers, the most suitable estimations at this stage should be the modes. By definition it is the number which appears most frequently, so it should give the highest accuracy if we predict with the score modes, which are both 1 in this case, when no other additional information is available. This will give us the naive accuracy.
+
+```{r 14/Naive prediction accuracy}
+if(exists('accy_tbl')) rm(accy_tbl)
+
+accy_tbl <- TestData  %>%
+  summarize(HGAccy = mean(FTHG==1),
+            AGAccy = mean(FTAG==1),
+            TotalAccy = mean(FTHG==1 & FTAG==1))
+
+datatable(accy_tbl, list(dom ="t"), 
+          colnames = c("Algorithm", "Home Goal Accurary", "Away Goal Accurary", "Total Accuracy"),
+          rownames = "Naive baseline") %>% formatRound(1:3, 4)
+```
+
+We can see both home and away score predictions have an accuracy rate of around `r accy_tbl$HGAccy` and `r accy_tbl$AGAccy`, with an overall accuracy of roughly `r accy_tbl$TotalAccy`. In other words, we can expect to guess about 1 in `r round(1/accy_tbl$TotalAccy)` times correctly if we guess every single match as 1-1. In order to beat the bookies, we will have to do a much better job.
+
+Instead of working on the accuracy, however, we would use the Root Mean Square Error (RMSE) of the predictions to guide our training. It shows the degree to which how close (or far off) our predictions are when compared to the actual figures, so we can gauge the performance in tiny amount. Similar to the accuracy, the naive RMSE can be calculated to by guessing 1-1 for every match.
+
+```{r 15/Naive prediction RMSE}
+datatable(TestData %>%
+   summarize(HG_RMSE = sqrt(mean((FTHG - 1)^2)),
+             AG_RMSE = sqrt(mean((FTAG - 1)^2)),
+             Total_RMSE = sqrt(mean((FTHG - 1)^2 + (FTAG - 1)^2))),
+   list(dom ="t"), rownames = "Naive baseline",
+   colnames = c("Algorithm", "Home Goal RMSE", "Away Goal RMSE", "Total RMSE")) %>% 
+  formatRound(1:3, 4)
+```
+
+If allowed to guess with decimal places, the average scores would be used and the RMSE would be close to their standard deviations; yet as the scores can be only predicted in integers the RMSE would inevitably be higher. Although a smaller RMSE does not necessarily imply better accuracy, by improving this we shall be able to nudge closer to the actual figures and increase the accuracy.
+
+To forecast match scores from past results, we would first create data frames which contain scores of both home and away teams, and then build regression models. We would also try decision trees to and compare the results. The final accuracy will be evaluated by the test set, i.e. matches of the remaining 2023-24 season, to see if either algorithm could increase the success rate of the Correct Score prediction.
+
+------------------------------------------------------------------------
+
+# Analysis
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+## Linear regression models (LR)
+
+------------------------------------------------------------------------
+
+As each row of the epl_results data frame only contains results of a single match, we need to wrangle the data to include the past scores. To keep the number of predictors at a reasonable level, we only include results from past `r n` matches.
+
+In addition, to make the variable names as succinct as possible the following abbreviations are used:
+
+H (1st place) = Home team of the match in question 
+
+A (1st place) = Away team of the match in question
+
+H/h (2nd place) = full time (H)/half time (h) results of the previous home match of the team in question 
+
+A/a (2nd place) = full time (A)/half time (a) results of the previous away match of the team in question 
+
+X = head-to-head encounters
+
+G/g = Goals scored/conceded by the team in question
+
+Number suffix = order of previous match under the same home/away conditions
+
+For example:
+
+HHG02 would be the number of full-time (upper case 2nd H) goals scored (G) by the home team (1st H) in their 2nd last (02) home (2nd H) match; 
+
+Ahg05 would be the number of half-time (lower case h) goals conceded by (g) the away team (A) in their 5th last (05) home match (h). 
+
+------------------------------------------------------------------------
+
+### Analyzing same home/away condition match results
+
+------------------------------------------------------------------------
+
+Starting with past home results of the home teams and past away results of the away teams, the data frame TrainHA is created:
+
+```{r 16/Past results of the teams under the same home-away condition}
+TrainHA <- TrainData %>%
+  rename(TmpSeason = Season, TmpMatchDate=MatchDate, TmpAwayTeam=AwayTeam,
+         HG=FTHG, AG=FTAG, hG=HTHG, aG=HTAG) %>% # Change conflicting colnames
+  inner_join(epl_results, c("HomeTeam")) %>% filter(TmpMatchDate>MatchDate) %>%
+  group_by(HomeTeam, TmpMatchDate) %>% slice_max(MatchDate, n=n) %>%
+  mutate(Match=str_pad(rank(-rank(MatchDate)), 2, pad=0)) %>% ungroup %>%
+  select(-Season, -MatchDate,-AwayTeam) %>% # Create home team home match results
+  rename(AwayTeam = TmpAwayTeam, TmpHomeTeam = HomeTeam, HHG = FTHG, HHg = FTAG, HhG = HTHG, Hhg = HTAG) %>%
+  pivot_wider(names_from = Match, names_sep = "", values_from = c(HHG ,HHg, HhG,Hhg)) %>%
+  inner_join(epl_results, c("AwayTeam")) %>% filter(TmpMatchDate>MatchDate) %>%
+  group_by(AwayTeam, TmpMatchDate) %>% slice_max(MatchDate, n=n) %>%
+  mutate(Match=str_pad(rank(-rank(MatchDate)), 2, pad=0)) %>% ungroup %>%
+  select(-Season, -MatchDate, -HomeTeam) %>% # Create away team away match results
+  rename(AAG = FTAG, AAg = FTHG, AaG = HTAG, Aag = HTHG) %>%
+  pivot_wider(names_from = Match, names_sep = "", values_from = c(AAG, AAg, AaG, Aag)) %>%
+  rename_at(vars(starts_with("Tmp")),~str_replace(.,"Tmp","")) %>% # Restore conflicting colnames
+  arrange(Season, HomeTeam, MatchDate)
+```
+
+However, `r n` past matches are only an arbitrary number and do not necessarily constitute to the best predictors. After all, it should be the recent performances of the teams which count the most, while results of the distant past may not be of much significance. In order to determine the optimal number of matches to be included, we will use cross-validation to tune that parameter. Before this though, we have to determine the maximum size of the dataset to exclude rows with no data. 
+
+Another question we would like to answer at the same time is whether the addition of half-time scores would improve prediction. 
+
+The following code will determine the size of the TrainHA dataset for cross-validation, create a function to calculate the average RMSE with 20 simulations via cross-validation, and apply 1 to `r n` matches to the function to see which one produces the least overall RMSE, and the calculation will be performed using just full-time scores and including both full and half-time.   
+
+```{r 17/Set TrainHA data size, create models with different no. of matches and compute RMSE}
+set_sze <- TrainHA %>% select(matches("HHG|AAG")) %>% is.na %>% rowSums %>% {.==0} %>% sum
+
+TrainHA_RMSE <- function(i) rowMeans( # average the RMSE
+  sapply (1:20, function (repetitions) { # Perform Monte Carlo simulations
+    
+    set_idx <- TrainHA %>% select(matches(paste0("(HHG|AAG)",str_pad(1:i, 2, pad=0)))) %>%
+      is.na %>% rowSums %>% {which(.==0)} %>% sample(set_sze) # Exclude rows with missing data
+    
+    val_idx <- sample(set_idx, set_sze * 0.1) # Create the validation set
+    
+    train_idx <- setdiff(set_idx, val_idx) # Create the training set
+    
+    LR_TrainHAft <- lm(cbind(HG,AG) ~ ., data = TrainHA[train_idx,] %>% # Linear model considering full-time scores only
+                         select(matches(paste0("(HHG|AAG|HHg|AAg)", str_pad(1:i, 2, pad=0)),F), HG, AG))
+    
+    LR_TrainHAht <- lm(cbind(HG,AG) ~ ., data = TrainHA[train_idx,] %>% # Linear model considering both full- and half-time scores
+                         select(matches(paste0("(HHG|AAG|HHg|AAg)", str_pad(1:i, 2, pad=0)),T), HG, AG))
+    
+    cbind(
+      (predict(LR_TrainHAft, TrainHA[val_idx,]) - TrainHA[val_idx,] %>% select(HG,AG))^2 %>% 
+        rename(FTHG = HG, FTAG = AG) %>% mutate(FT_all = rowSums(.)),
+      (predict(LR_TrainHAht, TrainHA[val_idx,]) - TrainHA[val_idx,] %>% select(HG,AG))^2 %>% 
+        rename(HTHG = HG, HTAG = AG) %>% mutate(HT_all = rowSums(.))) %>% 
+      colMeans %>% sqrt})) # Predict scores with the model & compute RMSE
+
+sapply(1:n, TrainHA_RMSE) %>% t %>% as.data.frame %T>% {nHA<<-which.min(.$FT_all)} %>%
+  datatable(rownames = paste(1:n, "match(es)"),
+            colnames = c("RMSE", "FT HG", "FT AG", "FT Total", "HT HG", "HT AG", "HT Total"),
+            list(dom ="t", order = list(list(3,"asc")))) %>% formatRound(1:6, 4)
+
+```
+
+
+The results are very clear on the full-time half-time debate: including half-time scores increases the RMSE on all counts, so we will ditch them in future analyses. Also it can be seen that the RMSE for both the home and away score are reduced significantly, and as `r nHA` matches produce least RMSE, it will be used as the optimal parameter in our regression model.
+
+In the next section, we will include results of counter home/away conditions, i.e. past away results of the home teams and past home results of the away teams, to see if we can further improve the performance.
+
+------------------------------------------------------------------------
+
+### Including counter home/away condition match results
+
+------------------------------------------------------------------------
+
+Although past match results of the teams in question under the same home/away condition should be most relevant, results of their counter home/away conditions may also hold some weight as for how the teams are performing in general. In view of this, the data frame TrainHAAH is created from counter joining the home and away teams in the TrainHA data frame, so each team's previous counter home/away scores are also included in addition to their results under the same conditions.
+
+```{r 18/Include counter home-away of past match results for both teams}
+TrainHAAH <- TrainHA %>% select(-matches("HhG|Hhg|AaG|Aag",F)) %>% 
+  rename_all(~paste0("Tmp",.)) %>%  # Change conflicting colnames
+  inner_join(TrainHA, c("TmpHomeTeam"="AwayTeam")) %>% filter(TmpMatchDate>MatchDate) %>%
+  group_by(TmpHomeTeam, TmpMatchDate) %>% slice_max(MatchDate) %>% ungroup %>%
+  rename(HAG01 = AG, HAg01 = HG) %>% select(matches("Tmp|HA|AA")) %>%
+  rename_at(vars(starts_with("AA")), # Create home team away match results
+            ~paste0("H", str_sub(.,2,3), str_pad(as.numeric(str_sub(.,4))+1, 2, pad=0))) %>%
+  inner_join(TrainHA, c("TmpAwayTeam"="HomeTeam")) %>% filter(TmpMatchDate>MatchDate) %>%
+  group_by(TmpAwayTeam, TmpMatchDate) %>% slice_max(MatchDate) %>% ungroup %>%
+  rename(AHG01 = HG, AHg01 = AG, AhG01 = hG, Ahg01 = aG) %>% select(matches("Tmp|HA|AH|HH")) %>%
+  rename_at(vars(starts_with("HH")), # Create away team home match results
+            ~paste0("A", str_sub(.,2,3), str_pad(as.numeric(str_sub(.,4))+1, 2, pad=0))) %>%
+  rename_at(vars(starts_with("Tmp")),~str_replace(.,"Tmp","")) %>% # Restore conflicting colnames
+  select(Season, MatchDate, HomeTeam, AwayTeam, HG, AG, matches("HH"), matches("HAG",F), matches("HAg",F), 
+         matches("AA"), matches("AHG",F), matches("AHg",F)) %>%
+  arrange(HomeTeam, MatchDate) # Sort the variables and records
+```
+
+Notice because we are appending another TrainHA table as the past records to the original TrainHA table which shows the current fixture results, the "current" home/away match in the appending table is actually a previous match for the fixture concerned, so there is one more past match than in the same home-away scenario.
+
+Here again we will determine the size of the TrainHAAH dataset for cross-validation, create a function to calculate the average RMSE and apply 1 to `r n` counter home/away matches to the function to see which one produces the least overall RMSE.
+
+```{r 19/Set TrainHAAH data size, create models with different no. of matches and compute RMSE}
+set_sze <- TrainHAAH %>% select(matches("HHG|AAG|HAG|AHG")) %>% is.na %>% rowSums %>% {.==0} %>% sum
+
+set.seed(NULL)
+
+TrainHAAH_RMSE <- function(i) rowMeans( # average the RMSE
+  sapply (1:20, function (repetitions) { # Perform Monte Carlo simulations
+    
+    set_idx <- TrainHAAH %>% select(
+      matches(paste0("(HHG|AAG)",str_pad(nHA, 2, pad=0))),
+      matches(paste0("(HAG|AHG)",str_pad(1:i, 2, pad=0)))) %>%
+      is.na %>% rowSums %>% {which(.==0)} %>% sample(set_sze) # Exclude rows with missing data
+    
+    val_idx <- sample(set_idx, set_sze * 0.1) # Create the validation set
+    
+    train_idx <- setdiff(set_idx, val_idx) # Create the training set
+    
+    LR_TrainHAAH <- lm(cbind(HG,AG) ~ ., data = TrainHAAH[train_idx,] %>% # Build linear model
+                         select(matches(paste0("(HHG|AAG)",str_pad(nHA, 2, pad=0)), T),
+                                matches(paste0("(HAG|AHG)",str_pad(1:i, 2, pad=0)), T), HG, AG))
+    
+    (predict(LR_TrainHAAH, TrainHAAH[val_idx,]) - TrainHAAH[val_idx,] %>% select(HG,AG)) ^2 %>%
+      mutate(FT_all = rowSums(.)) %>% colMeans %>% sqrt})) # Predict scores with the model & compute its RMSE
+
+sapply(1:n, TrainHAAH_RMSE) %>% t %>% as.data.frame %T>% {nHAAH<<-which.min(.$FT_all)} %>% 
+  datatable(rownames = paste(1:n, "match(es)"), 
+            colnames = c("RMSE", "HG", "AG", "Total"),
+            list(dom ="t", order = list(list(3,"asc")))) %>% formatRound(1:3, 4)
+```
+The RMSE improves only slightly; still better than nothing though. Therefore, we will use `r nHA` past match results under the same and home/away conditions and `r nHAAH` under opposite conditions in the regression model.
+
+In the next section, we will include results of head-to-head encounters of the teams, both home and away, to see if we can further improve the performance.
+
+------------------------------------------------------------------------
+
+### Including recent head-to-head results
+
+------------------------------------------------------------------------
+
+Although we want to include more head-to-head history in our prediction, matches played too long ago might not have much significance on the current scenario. Therefore, we arbitrarily use 1100 days (about 3 years) as the limit for the previous encounter of which the results will be considered in the model. Also as can be seen, the number of available records decreases dramatically as we increase the number of past encounters:
+
+```{r 20/Number of available training records with increasing no. of head-to-head encounters, message=FALSE, warning=FALSE}
+datatable(TrainData %>% select(MatchDate, HomeTeam, AwayTeam) %>% rename(Date = MatchDate) %>%
+            inner_join(epl_results, c("HomeTeam", "AwayTeam")) %>% 
+            filter(between(as.Date(Date) - as.Date(MatchDate), 0, 1100)) %>%
+            group_by(Date, HomeTeam, AwayTeam) %>% summarize(HXH = n()-1) %>% 
+            group_by (HXH) %>% summarize(count=n()),
+          rownames = F, colnames = c("No. of previous head-to-head encounters within 3 yrs", "No. of matches"),
+          list(dom ="t", order = list(list(0,"desc"))))
+```
+
+Therefore, we will only stick to the last two head-to-head encounters between the teams, one under the same home/away condition and one under the opposite. These results will be denoted with an X between the match type (H/A) and goal type (G/g), and with just the digit 1 at the end as only the last head-to-head result is retrieved. For example, HHXg1 is the number of goals conceded by the home team in their last home match against the same opponents; AHXG1 is the number of goals scored by the away team in their last home match when the same opponents visited.
+
+The following code will create the results of these encounters and append them to the existing TrainHAAH data frame.
+
+```{r 21/Append last head-to-head results of the teams to the data frame, warning=FALSE}
+TrainHAAHX <- TrainData %>% select(MatchDate, HomeTeam, AwayTeam) %>% rename(Date=MatchDate) %>%
+  inner_join(epl_results, c("HomeTeam", "AwayTeam")) %>%
+  filter(between(as.Date(Date) - as.Date(MatchDate), 1, 1100)) %>% group_by(Date, HomeTeam, AwayTeam) %>%
+  slice_max(MatchDate, n=1) %>% mutate(Match=1) %>% ungroup %>% # Create same home/away results
+  select(-Season, -MatchDate) %>% rename (HHXG = FTHG, HHXg = FTAG) %>%
+  pivot_wider(names_from = Match,  names_sep = "", values_from = c(HHXG, HHXg)) %>%
+  inner_join(epl_results, c("AwayTeam"="HomeTeam", "HomeTeam"="AwayTeam")) %>%
+  filter(between(as.Date(Date) - as.Date(MatchDate), 1, 1100)) %>% group_by(Date, HomeTeam, AwayTeam)%>%
+  slice_max(MatchDate, n=1) %>% mutate(Match=1) %>% ungroup %>% # Create counter home/away results
+  select(-Season, -MatchDate) %>% rename (AHXG = FTHG, AHXg = FTAG) %>%
+  pivot_wider(names_from = Match,  names_sep = "", values_from = c(AHXG, AHXg)) %>%
+  rename(MatchDate=Date) %>% 
+  inner_join(TrainHAAH, c("MatchDate","HomeTeam", "AwayTeam")) %>%
+  select(Season, MatchDate, HomeTeam, AwayTeam, HG, AG,
+         starts_with(c("HHXG","AHXG","HHG","HAG","AAG","AHG")))
+```
+
+As we have decided to include only the last two encounters at maximum, there is no parameter to tune. Instead, we would like to see if the RMSE can be further improved by including these variables into the new model. If not, we might just leave them out. Again we will evaluate the RMSE using cross-validation.
+
+```{r 22/Update linear model to include H2H encounters and evaluate RMSE with test data}
+set.seed(NULL)
+
+rowMeans( # average the RMSE
+  sapply (1:20, function (repetitions) { # Perform Monte Carlo simulations
+    
+    val_idx <- sample(1:nrow(TrainHAAHX), nrow(TrainHAAHX) * 0.1) # Create the validation set
+    
+    train_idx <- setdiff(1:nrow(TrainHAAHX), val_idx) # Create the training set
+    
+    LR_HAAHX <- lm(cbind(HG,AG) ~ ., data = TrainHAAHX[train_idx,] %>% # Build linear model
+                         select(matches(paste0("(HHG|AAG|HHg|AAg)",str_pad(1:nHA, 2, pad=0)), T),
+                                matches(paste0("(HAG|AHG|HAg|AGg)",str_pad(1:nHAAH, 2, pad=0)), T),
+                                matches("X"), HG, AG))
+    
+  (predict(LR_HAAHX, TrainHAAHX[val_idx,]) - TrainHAAHX[val_idx,] %>% select(HG,AG)) ^2 %>%
+      mutate(Total = rowSums(.)) %>% colMeans(na.rm = T) %>% sqrt})) %>%
+  
+  t %>% as.data.frame %>% datatable(
+    rownames = "linear regression with H2H encounters",
+    colnames = c("Algorithm", "Home Goal RMSE", "Away Goal RMSE", "Total RMSE"), list(dom ="t")) %>% 
+  formatRound(1:3, 4)
+```
+The total RMSE shows a slight increase instead. So we would exclude these predictors in the final regression model, and evaluate the prediction accuracy in the test set with `r nHA` past match results under the same and home/away conditions and `r nHAAH` under opposite conditions. In order to do so, the test data have to be wrangled in the same manner as the training data.
+
+```{r 23/Prepare test data}
+TestHA <- TestData %>% select(-HTHG, -HTAG) %>%
+  rename(TmpSeason = Season, TmpMatchDate=MatchDate, TmpAwayTeam=AwayTeam,
+         HG=FTHG, AG=FTAG) %>% # Change conflicting colnames
+  inner_join(epl_results, c("HomeTeam")) %>% filter(TmpMatchDate>MatchDate) %>%
+  group_by(HomeTeam, TmpMatchDate) %>% slice_max(MatchDate, n=n) %>%
+  mutate(Match=str_pad(rank(-rank(MatchDate)), 2, pad=0)) %>% ungroup %>%
+  select(-Season, -MatchDate,-AwayTeam, -HTHG, -HTAG) %>% # Create home team home match results
+  rename(AwayTeam = TmpAwayTeam, TmpHomeTeam = HomeTeam, HHG = FTHG, HHg = FTAG) %>%
+  pivot_wider(names_from = Match, names_sep = "", values_from = c(HHG, HHg)) %>%
+  inner_join(epl_results, c("AwayTeam")) %>% filter(TmpMatchDate>MatchDate) %>%
+  group_by(AwayTeam, TmpMatchDate) %>% slice_max(MatchDate, n=n) %>%
+  mutate(Match=str_pad(rank(-rank(MatchDate)), 2, pad=0)) %>% ungroup %>%
+  select(-Season, -MatchDate, -HomeTeam, -HTHG, -HTAG) %>% # Create away team away match results
+  rename(AAG = FTAG, AAg = FTHG) %>%
+  pivot_wider(names_from = Match, names_sep = "", values_from = c(AAG, AAg)) %>%
+  rename_at(vars(starts_with("Tmp")),~str_replace(.,"Tmp","")) %>% # Restore conflicting colnames
+  arrange(Season, HomeTeam, MatchDate)
+
+TestHAAH <- TestHA %>%
+  rename_all(~paste0("Tmp",.)) %>%  # Change conflicting colnames
+  inner_join(TrainHA, c("TmpHomeTeam"="AwayTeam")) %>% filter(TmpMatchDate>MatchDate) %>%
+  group_by(TmpHomeTeam, TmpMatchDate) %>% slice_max(MatchDate) %>% ungroup %>%
+  rename(HAG01 = AG, HAg01 = HG) %>% select(matches("Tmp|HA|AA")) %>%
+  rename_at(vars(starts_with("AA")), # Create home team away match results
+            ~paste0("H", str_sub(.,2,3), str_pad(as.numeric(str_sub(.,4))+1, 2, pad=0))) %>%
+  inner_join(TrainHA, c("TmpAwayTeam"="HomeTeam")) %>% filter(TmpMatchDate>MatchDate) %>%
+  group_by(TmpAwayTeam, TmpMatchDate) %>% slice_max(MatchDate) %>% ungroup %>%
+  rename(AHG01 = HG, AHg01 = AG) %>% select(matches("Tmp|HA|AH|HH")) %>%
+  rename_at(vars(starts_with("HH")), # Create away team home match results
+            ~paste0("A", str_sub(.,2,3), str_pad(as.numeric(str_sub(.,4))+1, 2, pad=0))) %>%
+  rename_at(vars(starts_with("Tmp")),~str_replace(.,"Tmp","")) %>% # Restore conflicting colnames
+  select(Season, MatchDate, HomeTeam, AwayTeam, HG, AG, matches("HH"), matches("HAG",F), 
+         matches("HAg",F), matches("AA"), matches("AHG",F), matches("AHg",F)) %>%
+  arrange(HomeTeam, MatchDate) # Sort the variables and records
+```
+
+Then the accuracy is evaluated with the regression model.
+
+```{r 24/Evaluate prediction accuracy with the linear model}
+LN_HAAH <- lm(cbind(HG,AG) ~ ., 
+                data = TrainHAAH %>% select(
+                  matches(paste0("(HHG|AAG)", str_pad(1:nHA, 2, pad=0)), F),
+                  matches(paste0("(HAG|AHG)", str_pad(1:nHAAH, 2, pad=0)), F),
+                  HG, AG)) # Build linear model
+
+accy_tbl <- rbind(accy_tbl,
+                  (predict(LN_HAAH, TestHAAH) %>% round == TestHAAH %>% select(HG,AG)) %>% 
+                     as.data.frame %>% mutate(Total = HG * AG) %>% colMeans(na.rm = T))
+
+datatable(accy_tbl, list(dom ="t"), 
+          colnames = c("Algorithm", "Home Goal Accurary", "Away Goal Accurary", "Total Accuracy"),
+          rownames = c("Naive baseline", 
+                       "Regression with past home and away matches")) %>%
+  formatRound(1:3, 4)
+```
+It seems the prediction accuracy slightly increases when compared to the naive accuracy. However, can we do better? Let's try another algorithm - decision trees.
+
+------------------------------------------------------------------------
+
+## Decison tree models (DT)
+
+------------------------------------------------------------------------
+
+The decision trees is another algorithm commonly used in modelling. As its name suggests, the algorithm creates a series of dichotomy which divides the training data in the original pool, called the base node, into smaller nodes according to certain criteria of the predictors, with the model represented by a tree diagram. When the predicting outcome is a continuous value, it is called a regression tree; when it is a distinct category (class) it is called a classification tree. The regression tree searches for a certain value of a certain predictor to split based on the largest sum of squared error (SSE) improvement after the split. In contrast, the classification tree will employ a metric called Gini-impurity which measures the degree of mis-classification when determining the splits (7). 
+
+As for deciding when to stop splitting on the first attempt (aka growing the tree), the algorithm relies on a measure called complexity parameter (cp). The concept indeed sounds a bit complex, but in short it measures the improvement in accuracy relative to the base node with each additional split. For example, if the cp threshold is set at 0.01, additional splitting will not perform if it does not reduce the relative error by 1% upwards. This is analogous to the kappa value in the confusion matrix. More information about this can be found on bookdown.org (8).
+
+In relation to the current project, we will treat the Correct Scores as continuous variables. The data frame TrainHAAHX with all the previous home and away matches as well as the last home/away head-to-head matches will be used as training data. The R package rpart is used to execute the algorithm. It will create two models which individually predict HG and AG. The cp has been manually chosen as 0.02 which produces visually optimal splits. Although the rpart package already has the function, another package rpart.plot is used to draw the trees in a more readable and aesthetic manner.
+
+```{r 25/Create decison tree models}
+DT_HG <- rpart(HG ~ ., # Create HG decision tree model
+                   data = TrainHAAHX %>%　
+                     select(matches("HHG|AAG|HAG|AHG|X"), HG) %>%
+                     filter(rowSums(is.na(.))==0),
+                   cp = 0.02)
+
+rpart.plot(DT_HG, main = "Home Goal prediction decision tree", digits = 3) # Draw the HG decision tree
+
+DT_AG <- rpart(AG ~ ., # Create AG decision tree model
+                   data = TrainHAAHX %>% 
+                     select(matches("HHG|AAG|HAG|AHG|X"), AG) %>%
+                     filter(rowSums(is.na(.))==0),
+                   cp = 0.02)
+
+rpart.plot(DT_AG, main = "Away Goal prediction decision tree", digits = 3) # Draw the AG decision tree
+```
+
+The first number in each node is the predicted number of goals scored in that node, which will be rounded to integers in the final evaluation. The more number of goals predicted, the darker is the node color. The bold expressions are the criteria applied to split the observations at each node into smaller ones, with observations fulfilling the expression going to the left. Finally, the percentage in each node indicates the proportion of the data it contains, with the base node being 100%. 
+
+To illustrate, Liverpool played their away match against Tottenham on 30 Sep 2023. The corresponding parameters are listed below.
+
+```{r 26/Decision tree example}  
+TrainHAAHX %>% filter(as.Date(MatchDate)=="2023-09-30" & AwayTeam=="Liverpool") %>% 
+  select(matches(DT_AG$frame$var, F)) %>% datatable(rownames = "Liverpool away goal predictors", list(dom="t"))
+```
+
+Following the away score decision tree will lead to `r predict(DT_AG, TrainHAAHX %>% filter (as.Date(MatchDate)=="2023-09-30" & AwayTeam=="Liverpool")) %>% round (2)` - rounded to `r predict(DT_AG, TrainHAAHX %>% filter (as.Date(MatchDate)=="2023-09-30" & AwayTeam=="Liverpool")) %>% round` goal(s) against Tottenham, which is `r ifelse(predict(DT_AG, TrainHAAHX %>% filter (as.Date(MatchDate)=="2023-09-30" & AwayTeam=="Liverpool")) %>% round == 1,"correct", "incorrect")` as Liverpool lost by 1-2.
+
+Decision tree models look good on the surface, but they are prone to overfitting. To handle this issue, the rpart package has a built-in procedure which calculates the relative errors obtained during cross-validation (x-error) against the tree size, i.e. number of terminal nodes. The plotcp function display results of the cross-validation.
+
+```{r 27/Show cross-validation result tables}
+plotcp(DT_HG, main = "Home Goal cross validation")
+plotcp(DT_AG, main = "Away Goal cross validation")
+```
+
+
+As seen from above, x-error is lowest within the first 2 nodes for both models. This is not to mention the very wide range of standard error for each measurement. Normally the tree should be "pruned" to the smallest size whose standard error range still covers the dotted line, but that would mean no splits at all for both models. Therefore we would just leave them as they are and see how they perform against the test data. 
+
+As the data frame TestHAAH has yet to include the head-to-head results, we will add those records to create TestHAAHX before the evaluation.
+
+
+```{r 28/Append last head-to-head results of the teams to the data frame, warning=FALSE}
+TestHAAHX <- TestData %>% select(MatchDate, HomeTeam, AwayTeam) %>% rename(Date=MatchDate) %>%
+  inner_join(epl_results, c("HomeTeam", "AwayTeam")) %>%
+  filter(between(as.Date(Date) - as.Date(MatchDate), 1, 1100)) %>% group_by(Date, HomeTeam, AwayTeam) %>%
+  slice_max(MatchDate, n=1) %>% mutate(Match=1) %>% ungroup %>% # Create same home/away results
+  select(-Season, -MatchDate) %>% rename (HHXG = FTHG, HHXg = FTAG) %>%
+  pivot_wider(names_from = Match,  names_sep = "", values_from = c(HHXG, HHXg)) %>%
+  inner_join(epl_results, c("AwayTeam"="HomeTeam", "HomeTeam"="AwayTeam")) %>%
+  filter(between(as.Date(Date) - as.Date(MatchDate), 1, 1100)) %>% group_by(Date, HomeTeam, AwayTeam)%>%
+  slice_max(MatchDate, n=1) %>% mutate(Match=1) %>% ungroup %>% # Create counter home/away results
+  select(-Season, -MatchDate) %>% rename (AHXG = FTHG, AHXg = FTAG) %>%
+  pivot_wider(names_from = Match,  names_sep = "", values_from = c(AHXG, AHXg)) %>%
+  rename(MatchDate=Date) %>% 
+  inner_join(TestHAAH, c("MatchDate","HomeTeam", "AwayTeam")) %>%
+  select(Season, MatchDate, HomeTeam, AwayTeam, HG, AG,
+         starts_with(c("HHXG","AHXG","HHG","HAG","AAG","AHG")))
+```
+
+Then the accuracy is evaluated with the decision tree model.
+
+```{r 29/Decision tree accuracy evaluation, warning=FALSE}
+accy_tbl <- rbind(accy_tbl, 
+                  data.frame(HG = (predict(DT_HG, TestHAAHX) %>% round) == (TestHAAHX %>% pull(HG)),
+                             AG = (predict(DT_AG, TestHAAHX) %>% round) == (TestHAAHX %>% pull(AG))) %>% 
+                    mutate(Total = HG * AG) %>% colMeans)
+
+datatable(accy_tbl, list(dom ="t"), 
+          colnames = c("Algorithm", "Home Goal Accurary", "Away Goal Accurary", "Total Accuracy"),
+          rownames = c("Naive baseline", 
+                       "Regression with past home and away matches",
+                       "Decistion trees")) %>% formatRound(1:3, 4)
+```
+
+The results are far from satisfactory - the total accuracy is worse than the naive baseline. It seems the cross-validation results earlier have foretold the overfitting problem. The scores in the previous matches are just not accurate enough for the decision tree to make any precise call in the current match. But what if we add more trees to the model? This brings us to random forests.
+
+------------------------------------------------------------------------
+
+## Random forest models (RF)
+
+------------------------------------------------------------------------
+
+Random forests have been hailed as a very powerful algorithm in machine learning. By averaging results of an ensemble of decision trees, the algorithm can make predictions which are rather immune to sample bias, as compared to just using one decision tree. This can well be summed up by the statement: A large number of relatively uncorrelated trees operating as a committee will outperform any individual one (9). The use of bootstrap aggregation and the arbitrary selection of features in each decision tree create the randomness necessary for the trees to de-correlate with each other. 
+
+In relation to the current project, we will use the most popular package randomForest, already been loaded at the beginning, to train from the same data frame TrainHAAHX. As in the case of decision trees, we will create two separate models for home and away goals, each with 500 trees that is the default setting, and plot their errors against the number of trees to check if that would suffice.
+
+```{r 30/Create random forest models and check ntree performance}
+RF_HG <- randomForest(HG ~ .,  data = TrainHAAHX %>% select(-AG)) # Create HG random forest model
+RF_AG <- randomForest(AG ~ .,  data = TrainHAAHX %>% select(-HG)) # Create AG random forest model
+
+plot(RF_HG, main = "Home Goal prediction error by tree no.")
+plot(RF_AG, main = "Away Goal prediction error by tree no.")
+```
+
+As the graphs show the errors have more or less stabilized by 300 trees, we would just use that number to reduce computation time. With that set, let us see if we can predict better with random forests. First we look at the RMSE with the test data.
+
+```{r 31/Reduce the tree size of the models, then evaluate RMSE of random forest model with testing data}
+RF_HG <- randomForest(HG ~ .,  data = TrainHAAHX %>% select(-AG), ntree=300) # Rebuild the models with less trees
+RF_AG <- randomForest(AG ~ .,  data = TrainHAAHX %>% select(-HG), ntree=300)
+
+data.frame (HG = (predict(RF_HG, TestHAAHX) - (TestHAAHX %>% select(HG)))^2, 
+            AG = (predict(RF_AG, TestHAAHX) - (TestHAAHX %>% select(AG)))^2) %>% 
+            mutate(Total = HG + AG) %>% colMeans %>% sqrt %>% 
+  t %>% as.data.frame %>% datatable(
+    rownames = "Random Forests",
+    colnames = c("Algorithm", "Home Goal RMSE", "Away Goal RMSE", "Total RMSE"), list(dom ="t")) %>% 
+  formatRound(1:3, 4)
+```
+
+Unfortunately, the RMSE is worse than the linear regression model! Let's see how they accuracy compares also.
+
+```{r 32/Evaluate prediction accuracy with the random forest model}
+accy_tbl <- rbind(accy_tbl, 
+                  data.frame(HG = (predict(RF_HG, TestHAAHX) %>% round) == (TestHAAHX %>% pull(HG)),
+                             AG = (predict(RF_AG, TestHAAHX) %>% round) == (TestHAAHX %>% pull(AG))) %>% 
+                    mutate(Total = HG * AG) %>% colMeans)
+
+datatable(accy_tbl, list(dom ="t"), 
+          colnames = c("Algorithm", "Home Goal Accurary", "Away Goal Accurary", "Total Accuracy"),
+          rownames = c("Naive baseline", 
+                       "Regression with same & counter home-away conditions",
+                       "Decision trees",
+                       "Random forests")) %>% 
+  formatRound(1:3, 4)
+```
+
+In line with the RMSE, the overall accuracy is worse than the linear regression model. Therefore the regression model is the best we have got, which is still far from useful in beating the bookies.
+
+------------------------------------------------------------------------
+
+# Conclusion
+
+------------------------------------------------------------------------
+
+The failure to improve the Correct Score prediction accuracy despite a comprehensive database is rather disappointing. While it might be tempting to believe the statistical models fail completely, the slight increase in accuracy in the regression model suggests not all effort is futile. Perhaps a look of the confusion matrices would shed some light as to how the predictions fail:
+
+```{r 33/Confusion matrices for random forest models, warning=FALSE}
+# Confusion matrix for home goals
+confusionMatrix(predict(LN_HAAH, TestHAAH)[,1] %>% round %>% factor, TestHAAH$HG %>% factor)
+
+# Confusion matrix for away goals
+confusionMatrix(predict(LN_HAAH, TestHAAH)[,2] %>% round %>% factor, TestHAAH$AG %>% factor)
+```
+
+One interesting pattern is observed from the above matrices. While the home score model has moderate chance of hitting correctly for a 1 or 2 goal outcome (sensitivities of class 1 and 2), both home and away models fail to predict nil score at all, which constitute to `r mean(TestHAAH$HG==0) %>% round(2)` of home team scores and `r mean(TestHAAH$AG==0) %>% round(2)` of away team scores, thereby seriously undermining prediction accuracy.
+
+One possible reason of this is due to the skewness of the goal distribution, which follows a Poisson pattern. The parameter used in training, the RMSE, concerns not just whether there is deviation from the actual scores, but also how big the deviations are; the more the deviation the higher the RMSE. Therefore the relatively few matches with high number of goals might train the algorithm to predict towards the high end between two outcomes with approximately the same chance of occurring, say between 1 and 0, thus eliminating all nil score predictions. In contrast, the accuracy analysis only concerns whether the predicted scores are exactly correct; it does not make a difference if they miss by an inch or a mile. As a result a discrepancy exists between the training and evaluation parameters, which might ultimately undermine its performance.
+
+Moreover, if the exact scores of a football match in reality depends on many random factors, or variables beyond the dataset, such as pure luck, it is not quite possible to predict them with an unreasonably level of accuracy. An analogy would be that while we can forecast weather temperatures within a range with confidence, it would not help if the correct predictions have to be within 0.1 degrees Celsius. The random noise there simply far outweighs the observable signals on such a minute scale.
+
+Despite the unsatisfactory outcome, this is still a very meaningful project, with a lot of statistical knowledge, machine learning algorithms and coding skills being employed along the way. Perhaps if time allows in the future, other parameters or algorithms can be tested. On the other hand though, trying to out-win the bookies by Correct Scores may not be a realistic idea due to the above rationale. Perhaps Full-Time Result or Total Goals, which allow a larger margin of randomness, are more suitable candidates for the challenge.
+
+------------------------------------------------------------------------
+
+# References
+
+------------------------------------------------------------------------
+
+1.  Premier League viewership and online betting numbers <https://www.sportsmole.co.uk/football/features/premier-league-viewership-and-online-betting-numbers_506592.html>
+
+2.  Betting on the English Premier League <https://towardsdatascience.com/betting-on-the-english-premier-league-making-money-with-machine-learning-fb6938760c64>
+
+3.  England Football Results Betting Odds | Premiership Results & Betting Odds 
+<https://www.football-data.co.uk/englandm.php>
+
+4.  While the portal of the website is <https://www.premierleague.com>, specific details of each match can be retrieved choosing Premier League -\> Results in the menu bar than filter the results by Season.
+
+5.  Is There An Actual Home Field Advantage When A Sports Team Plays In Their Home Stadium? <https://www.scienceabc.com/social-science/is-there-an-actual-home-field-advantage-when-a-sports-team-plays-in-their-home-stadium.html>
+
+6.  How has the COVID-19 pandemic affected Premier League football? <https://www.premierleague.com/news/1682374>
+
+7.  Gini Impurity Measure – a simple explanation using python <https://towardsdatascience.com/gini-impurity-measure-dbd3878ead33>
+
+8.  Classification Tree. <https://bookdown.org/mpfoley1973/data-sci/classification-tree.html>
+
+9.  The Random Forest Classifier <https://towardsdatascience.com/understanding-random-forest-58381e0602d2>
